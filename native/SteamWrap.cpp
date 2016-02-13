@@ -1,5 +1,6 @@
 #define IMPLEMENT_API
 #include <hx/CFFI.h>
+#include <hx/CFFIPrime.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,59 @@ static const char* kEventTypeUGCLegalAgreement = "UGCLegalAgreementStatus";
 static const char* kEventTypeUGCItemCreated = "UGCItemCreated";
 static const char* kEventTypeOnItemUpdateSubmitted = "UGCItemUpdateSubmitted";
 
+//A simple data structure that holds on to the native 64-bit handles and maps them to regular ints.
+//This is because it is cumbersome to pass back 64-bit values over CFFI, and strictly speaking, the haxe 
+//side never needs to know the actual values. So we just store the full 64-bit values locally and pass back 
+//0-based index values which easily fit into a regular int.
+class steamHandleMap
+{
+	//TODO: figure out templating or whatever so I can make typed versions of this like in Haxe (steamHandleMap<ControllerHandle_t>)
+	//      all the steam handle typedefs are just renamed uint64's, but this could always change so to be 100% super safe I should
+	//      figure out the templating stuff.
+	
+	private:
+		std::map<int, uint64> values;
+		std::map<int, uint64>::iterator it;
+		int maxKey;
+		
+	public:
+		
+		void init()
+		{
+			values.clear();
+			maxKey = -1;
+		}
+		
+		bool exists(uint64 val)
+		{
+			return (values.find(val) != values.end());
+		}
+		
+		uint64 get(int index)
+		{
+			return values[index];
+		}
+		
+		//add a unique uint64 value to this data structure & return what index it was stored at
+		int add(uint64 val)
+		{
+			it = values.find(val);
+			
+			//if it already exists just return where it is stored
+			if(it != values.end())
+			{
+				return it->first;
+			}
+			
+			//if it is unique increase our maxKey count and return that
+			maxKey++;
+			values[maxKey] = val;
+			return maxKey;
+		}
+};
+
+static steamHandleMap mapControllers;
+static ControllerAnalogActionData_t analogActionData;
 
 struct Event
 {
@@ -47,6 +101,20 @@ static void SendEvent(const Event& e)
     alloc_field(obj, val_id("success"), alloc_int(e.m_success ? 1 : 0));
     alloc_field(obj, val_id("data"), alloc_string(e.m_data.c_str()));
     val_call1(g_eventHandler->get(), obj);
+}
+
+static value handleToValStr(uint64 handle)
+{
+	std::ostringstream data;
+	data << handle;
+	return alloc_string(data.str().c_str());
+}
+
+static uint64 valStrToHandle(value str)
+{
+	ControllerHandle_t c_handle;
+	sscanf(val_string(str), "%I64x", &c_handle);
+	return c_handle;
 }
 
 //-----------------------------------------------------------------------------------------------------------
@@ -687,6 +755,240 @@ value SteamWrap_GetCurrentGameLanguage()
 	return alloc_string(result);
 }
 DEFINE_PRIM(SteamWrap_GetCurrentGameLanguage, 0);
+
+//-----------------------------------------------------------------------------------------------------------
+value SteamWrap_InitControllers()
+{
+	bool result = SteamController()->Init();
+	
+	if (result)
+	{
+		mapControllers.init();
+		
+		analogActionData.eMode = k_EControllerSourceMode_None;
+		analogActionData.x = 0.0;
+		analogActionData.y = 0.0;
+		analogActionData.bActive = false;
+	}
+	
+	return alloc_bool(result);
+}
+DEFINE_PRIM(SteamWrap_InitControllers,0);
+
+//-----------------------------------------------------------------------------------------------------------
+value SteamWrap_ShutdownControllers()
+{
+	bool result = SteamController()->Shutdown();
+	if (result)
+	{
+		mapControllers.init();
+	}
+	return alloc_bool(result);
+}
+DEFINE_PRIM(SteamWrap_ShutdownControllers,0);
+
+//-----------------------------------------------------------------------------------------------------------
+value SteamWrap_GetConnectedControllers()
+{
+	SteamController()->RunFrame();
+	
+	ControllerHandle_t handles[STEAM_CONTROLLER_MAX_COUNT];
+	int result = SteamController()->GetConnectedControllers(handles);
+	
+	std::ostringstream returnData;
+	
+	//store the handles locally and pass back a string representing an int array of unique index lookup values
+	
+	for(int i = 0; i < result; i++)
+	{
+		if(false == mapControllers.exists(handles[i]))
+		{
+			int index = mapControllers.add(handles[i]);
+			returnData << index;
+			if(i != result-1)
+			{
+				returnData << ",";
+			}
+		}
+	}
+	
+	return alloc_string(returnData.str().c_str());
+}
+DEFINE_PRIM(SteamWrap_GetConnectedControllers,0);
+
+//-----------------------------------------------------------------------------------------------------------
+int SteamWrap_GetActionSetHandle(const char * actionSetName)
+{
+
+	ControllerActionSetHandle_t handle = SteamController()->GetActionSetHandle(actionSetName);
+	return handle;
+}
+DEFINE_PRIME1(SteamWrap_GetActionSetHandle);
+
+//-----------------------------------------------------------------------------------------------------------
+int SteamWrap_GetDigitalActionHandle(const char * actionName)
+{
+
+	return SteamController()->GetDigitalActionHandle(actionName);
+}
+DEFINE_PRIME1(SteamWrap_GetDigitalActionHandle);
+
+//-----------------------------------------------------------------------------------------------------------
+int SteamWrap_GetAnalogActionHandle(const char * actionName)
+{
+
+	ControllerAnalogActionHandle_t handle = SteamController()->GetAnalogActionHandle(actionName);
+	return handle;
+}
+DEFINE_PRIME1(SteamWrap_GetAnalogActionHandle);
+
+//-----------------------------------------------------------------------------------------------------------
+int SteamWrap_GetDigitalActionData(int controllerHandle, int actionHandle)
+{
+	
+	ControllerHandle_t c_handle              = mapControllers.get(controllerHandle);
+	ControllerDigitalActionHandle_t a_handle = actionHandle;
+	
+	ControllerDigitalActionData_t data = SteamController()->GetDigitalActionData(c_handle, a_handle);
+	
+	int result = 0;
+	
+	//Take both bools and pack them into an int
+	
+	if(data.bState) {
+		result |= 0x1;
+	}
+	
+	if(data.bActive) {
+		result |= 0x10;
+	}
+	
+	return result;
+}
+DEFINE_PRIME2(SteamWrap_GetDigitalActionData);
+
+
+//-----------------------------------------------------------------------------------------------------------
+//stashes the requested analog action data in local state and returns the bActive member value
+//you need to immediately call _eMode(), _x(), and _y() to get the rest
+
+int SteamWrap_GetAnalogActionData(int controllerHandle, int actionHandle)
+{
+	ControllerHandle_t c_handle = mapControllers.get(controllerHandle);
+	ControllerAnalogActionHandle_t a_handle = actionHandle;
+	
+	analogActionData = SteamController()->GetAnalogActionData(c_handle, a_handle);
+	
+	return analogActionData.bActive;
+}
+DEFINE_PRIME2(SteamWrap_GetAnalogActionData);
+
+int SteamWrap_GetAnalogActionData_eMode(int dummy)
+{
+	return analogActionData.eMode;
+}
+DEFINE_PRIME1(SteamWrap_GetAnalogActionData_eMode);
+
+float SteamWrap_GetAnalogActionData_x(int dummy)
+{
+	return analogActionData.x;
+}
+DEFINE_PRIME1(SteamWrap_GetAnalogActionData_x);
+
+float SteamWrap_GetAnalogActionData_y(int dummy)
+{
+	return analogActionData.y;
+}
+DEFINE_PRIME1(SteamWrap_GetAnalogActionData_y);
+
+//-----------------------------------------------------------------------------------------------------------
+value SteamWrap_GetDigitalActionOrigins(value controllerHandle, value actionSetHandle, value digitalActionHandle)
+{
+	ControllerHandle_t c_handle              = mapControllers.get(val_int(controllerHandle));
+	ControllerActionSetHandle_t s_handle     = val_int(actionSetHandle);
+	ControllerDigitalActionHandle_t a_handle = val_int(digitalActionHandle);
+	
+	EControllerActionOrigin origins[STEAM_CONTROLLER_MAX_ORIGINS];
+	
+	//Initialize the whole thing to None to avoid garbage
+	for(int i = 0; i < STEAM_CONTROLLER_MAX_ORIGINS; i++) {
+		origins[i] = k_EControllerActionOrigin_None;
+	}
+	
+	int result = SteamController()->GetDigitalActionOrigins(c_handle, s_handle, a_handle, origins);
+	
+	std::ostringstream data;
+	
+	data << result << ",";
+	
+	for(int i = 0; i < STEAM_CONTROLLER_MAX_ORIGINS; i++) {
+		data << origins[i];
+		if(i != STEAM_CONTROLLER_MAX_ORIGINS-1){
+			data << ",";
+		}
+	}
+	
+	return alloc_string(data.str().c_str());
+}
+DEFINE_PRIM(SteamWrap_GetDigitalActionOrigins,3);
+
+//-----------------------------------------------------------------------------------------------------------
+value SteamWrap_GetAnalogActionOrigins(value controllerHandle, value actionSetHandle, value analogActionHandle)
+{
+	ControllerHandle_t c_handle              = mapControllers.get(val_int(controllerHandle));
+	ControllerActionSetHandle_t s_handle     = val_int(actionSetHandle);
+	ControllerAnalogActionHandle_t a_handle  = val_int(analogActionHandle);
+	
+	EControllerActionOrigin origins[STEAM_CONTROLLER_MAX_ORIGINS];
+	
+	//Initialize the whole thing to None to avoid garbage
+	for(int i = 0; i < STEAM_CONTROLLER_MAX_ORIGINS; i++) {
+		origins[i] = k_EControllerActionOrigin_None;
+	}
+	
+	int result = SteamController()->GetAnalogActionOrigins(c_handle, s_handle, a_handle, origins);
+	
+	std::ostringstream data;
+	
+	data << result << ",";
+	
+	for(int i = 0; i < STEAM_CONTROLLER_MAX_ORIGINS; i++) {
+		data << origins[i];
+		if(i != STEAM_CONTROLLER_MAX_ORIGINS-1){
+			data << ",";
+		}
+	}
+	
+	return alloc_string(data.str().c_str());
+}
+DEFINE_PRIM(SteamWrap_GetAnalogActionOrigins,3);
+
+//-----------------------------------------------------------------------------------------------------------
+int SteamWrap_ActivateActionSet(int controllerHandle, int actionSetHandle)
+{
+	
+	ControllerHandle_t c_handle          = mapControllers.get(controllerHandle);
+	ControllerActionSetHandle_t a_handle = actionSetHandle;
+	
+	SteamController()->ActivateActionSet(c_handle, a_handle);
+	
+	return true;
+}
+DEFINE_PRIME2(SteamWrap_ActivateActionSet);
+
+//-----------------------------------------------------------------------------------------------------------
+int SteamWrap_GetCurrentActionSet(int controllerHandle)
+{
+	ControllerHandle_t c_handle = mapControllers.get(controllerHandle);
+	
+	ControllerActionSetHandle_t a_handle = SteamController()->GetCurrentActionSet(c_handle);
+	
+	return a_handle;
+}
+DEFINE_PRIME1(SteamWrap_GetCurrentActionSet);
+
+
+
 
 //-----------------------------------------------------------------------------------------------------------
 
